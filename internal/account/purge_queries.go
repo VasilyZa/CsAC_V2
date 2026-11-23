@@ -7,6 +7,7 @@ const closedAccountConversations = `SELECT id FROM conversations
 
 const deletedAccountMessages = `SELECT conversation_id,seq FROM messages WHERE sender_id=$1
 	UNION SELECT conversation_id,seq FROM messages WHERE nudge_target_id=$1
+	UNION SELECT conversation_id,seq FROM messages WHERE system_subject_id=$1
 	UNION SELECT m.conversation_id,m.seq FROM messages m JOIN (` + closedAccountConversations + `) c ON c.id=m.conversation_id`
 
 const lockPurgeConversations = `WITH affected(id) AS (
@@ -17,6 +18,7 @@ const lockPurgeConversations = `WITH affected(id) AS (
 	UNION SELECT conversation_id FROM group_files WHERE uploader_id=$1
 	UNION SELECT conversation_id FROM featured_messages WHERE added_by=$1
 	UNION SELECT conversation_id FROM messages WHERE sender_id=$1 OR nudge_target_id=$1 OR recalled_by=$1
+	UNION SELECT conversation_id FROM messages WHERE system_subject_id=$1
 	UNION SELECT conversation_id FROM messages WHERE cardinality(mention_ids)>0 AND mention_ids @> ARRAY[$1]::bigint[]
 ) SELECT c.id FROM affected x JOIN conversations c USING(id) ORDER BY c.id FOR UPDATE OF c`
 

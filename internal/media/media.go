@@ -183,17 +183,20 @@ func findReadable(ctx context.Context, db rpc.DB, id string, actor rpc.Actor) (O
 			OR (m.purpose='avatar' AND (
 				EXISTS (SELECT 1 FROM accounts a WHERE a.avatar_id=m.id AND a.status='active')
 				OR EXISTS (SELECT 1 FROM conversations c WHERE c.avatar_id=m.id AND c.kind='group' AND c.archived_at IS NULL
-					AND (c.visibility='public' OR ($2>0 AND $3 AND EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id=c.id AND cm.user_id=$2))))
+					AND (c.visibility='public' OR ($2>0 AND $3 AND (
+						EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id=c.id AND cm.user_id=$2)
+						OR EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=$2)))))
 			))
 			OR ($2>0 AND $3 AND CASE m.purpose
 				WHEN 'message' THEN EXISTS (
-					SELECT 1 FROM messages msg JOIN chat_readers r ON r.conversation_id=msg.conversation_id AND r.user_id=$2
+					SELECT 1 FROM messages msg JOIN chat_reviewers r ON r.conversation_id=msg.conversation_id AND r.user_id=$2
 					WHERE msg.attachment_id=m.id AND msg.recalled_at IS NULL
 				) OR EXISTS (SELECT 1 FROM stickers st WHERE st.media_id=m.id)
 				WHEN 'group' THEN EXISTS (
 					SELECT 1 FROM group_files gf JOIN conversations c ON c.id=gf.conversation_id
-					JOIN conversation_members cm ON cm.conversation_id=c.id AND cm.user_id=$2
+					LEFT JOIN conversation_members cm ON cm.conversation_id=c.id AND cm.user_id=$2
 					WHERE gf.media_id=m.id AND c.kind='group' AND c.archived_at IS NULL
+					AND (cm.user_id IS NOT NULL OR EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=$2))
 				)
 				WHEN 'space' THEN EXISTS (
 					SELECT 1 FROM space_post_media link JOIN space_posts p ON p.id=link.post_id

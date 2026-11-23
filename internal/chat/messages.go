@@ -144,7 +144,7 @@ func send(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error) 
 	}
 	var replyAuthor int64
 	if in.Reply != nil {
-		err := call.DB.QueryRow(ctx, `SELECT sender_id FROM messages WHERE conversation_id=$1 AND seq=$2 AND recalled_at IS NULL`, in.ConversationID, *in.Reply).Scan(&replyAuthor)
+		err := call.DB.QueryRow(ctx, `SELECT sender_id FROM messages WHERE conversation_id=$1 AND seq=$2 AND recalled_at IS NULL AND kind<>'system'`, in.ConversationID, *in.Reply).Scan(&replyAuthor)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, rpc.Invalid("Reply target unavailable")
 		}
@@ -215,16 +215,19 @@ func replyNotice(author, sender int64, members []int64) []int64 {
 
 type message struct {
 	messageCreated
-	Nickname       string     `json:"sender_name,omitempty"`
-	Text           string     `json:"text,omitempty"`
-	Attachment     *string    `json:"attachment_id,omitempty"`
-	Duration       *int32     `json:"duration_ms,omitempty"`
-	TargetID       *int64     `json:"target_id,omitempty"`
-	Reply          *int64     `json:"reply_to,string,omitempty"`
-	Mentions       []int64    `json:"mention_ids,omitempty"`
-	RecalledAt     *time.Time `json:"recalled_at,omitempty"`
-	Featured       bool       `json:"featured,omitempty"`
-	FeaturedBy     *int64     `json:"featured_by,omitempty"`
-	FeaturedByName *string    `json:"featured_by_name,omitempty"`
-	FeaturedAt     *time.Time `json:"featured_at,omitempty"`
+	Nickname          string     `json:"sender_name,omitempty"`
+	Text              string     `json:"text,omitempty"`
+	Attachment        *string    `json:"attachment_id,omitempty"`
+	Duration          *int32     `json:"duration_ms,omitempty"`
+	TargetID          *int64     `json:"target_id,omitempty"`
+	Reply             *int64     `json:"reply_to,string,omitempty"`
+	Mentions          []int64    `json:"mention_ids,omitempty"`
+	RecalledAt        *time.Time `json:"recalled_at,omitempty"`
+	Featured          bool       `json:"featured,omitempty"`
+	FeaturedBy        *int64     `json:"featured_by,omitempty"`
+	FeaturedByName    *string    `json:"featured_by_name,omitempty"`
+	FeaturedAt        *time.Time `json:"featured_at,omitempty"`
+	SystemAction      *string    `json:"system_action,omitempty"`
+	SystemSubject     *int64     `json:"system_subject_id,omitempty"`
+	SystemSubjectName *string    `json:"system_subject_name,omitempty"`
 }

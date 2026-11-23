@@ -76,11 +76,13 @@ func reply(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error)
 }
 
 func addItem(ctx context.Context, call rpc.Call, in contentInput, parent, replyTo *int64, viewers audience) (any, error) {
-	content := strings.TrimSpace(in.Content)
-	if len(content) > 4000 || strings.ContainsRune(content, 0) || len(in.MediaIDs) > 9 || (content == "" && len(in.MediaIDs) == 0) {
+	// Keep Markdown indentation and line breaks when storing non-empty text.
+	content := in.Content
+	blank := strings.TrimSpace(content) == ""
+	if len(content) > 4000 || strings.ContainsRune(content, 0) || len(in.MediaIDs) > 9 || (blank && len(in.MediaIDs) == 0) {
 		return nil, rpc.Invalid("Provide up to 4000 bytes of text or up to nine images")
 	}
-	if content == "" {
+	if blank {
 		content = "分享图片"
 	}
 	ids := slices.Clone(in.MediaIDs)

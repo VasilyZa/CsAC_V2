@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"csac/v2/internal/media"
+	"csac/v2/internal/moderation"
 	"csac/v2/internal/rpc"
 
 	"github.com/jackc/pgx/v5"
@@ -139,13 +140,31 @@ func lockWithRole(ctx context.Context, call rpc.Call, id int64) (lockedGroup, st
 	return group, role, err
 }
 
-func readGroupRole(ctx context.Context, call rpc.Call, id int64) (visibility, role string, err error) {
-	if id <= 0 {
-		return "", "", rpc.Invalid("conversation_id must be positive")
+type groupAuthority struct {
+	role      string
+	siteAdmin bool
+}
+
+func (a groupAuthority) manages() bool     { return a.siteAdmin || moderator(a.role) }
+func (a groupAuthority) administers() bool { return a.siteAdmin || a.role == ownerRole }
+
+func lockForManagement(ctx context.Context, call rpc.Call, id int64) (lockedGroup, groupAuthority, error) {
+	siteAdmin, err := moderation.IsSiteAdmin(ctx, call.DB, call.Actor.ID, true)
+	if err != nil {
+		return lockedGroup{}, groupAuthority{}, err
 	}
-	err = call.DB.QueryRow(ctx, `SELECT c.visibility,COALESCE(m.role,'') FROM conversations c
+	group, role, err := lockWithRole(ctx, call, id)
+	return group, groupAuthority{role: role, siteAdmin: siteAdmin}, err
+}
+
+func readGroupAuthority(ctx context.Context, call rpc.Call, id int64) (visibility string, authority groupAuthority, err error) {
+	if id <= 0 {
+		return "", authority, rpc.Invalid("conversation_id must be positive")
+	}
+	err = call.DB.QueryRow(ctx, `SELECT c.visibility,coalesce(m.role,''),EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=$2)
+		FROM conversations c
 		LEFT JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
-		WHERE c.id=$1 AND c.kind='group' AND c.archived_at IS NULL`, id, call.Actor.ID).Scan(&visibility, &role)
+		WHERE c.id=$1 AND `+openGroupSQL, id, call.Actor.ID).Scan(&visibility, &authority.role, &authority.siteAdmin)
 	return
 }
 
@@ -305,11 +324,11 @@ func editGroup(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, er
 	if err := in.clean(false); err != nil {
 		return nil, err
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(group.visibility, role, moderator(role)); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.manages()); err != nil {
 		return nil, err
 	}
 	avatarID, err := ownedAvatar(ctx, call, in.AvatarID)
@@ -342,11 +361,11 @@ func groupSettings(ctx context.Context, call rpc.Call, raw json.RawMessage) (any
 		in.CodeSingleUse == nil && in.FixedCode == nil && in.JoinQuestion == nil && in.GlobalMute == nil {
 		return nil, rpc.Invalid("Supply at least one group setting")
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(group.visibility, role, moderator(role)); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.manages()); err != nil {
 		return nil, err
 	}
 	if in.Visibility != nil {
@@ -382,7 +401,8 @@ func groupSettings(ctx context.Context, call rpc.Call, raw json.RawMessage) (any
 		}
 	}
 	if in.AllowInvite != nil && !*in.AllowInvite {
-		if err := cancelJoinRequests(ctx, call, group.id, `j.kind='invitation' AND NOT EXISTS (
+		if err := cancelJoinRequests(ctx, call, group.id, `j.kind='invitation'
+			AND NOT EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=j.inviter_id) AND NOT EXISTS (
 			SELECT 1 FROM conversation_members m WHERE m.conversation_id=j.conversation_id AND m.user_id=j.inviter_id AND m.role IN ('owner','admin'))`); err != nil {
 			return nil, err
 		}
@@ -401,11 +421,11 @@ func resetGroupCode(ctx context.Context, call rpc.Call, raw json.RawMessage) (an
 	if err != nil {
 		return nil, err
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(group.visibility, role, role == ownerRole); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.administers()); err != nil {
 		return nil, err
 	}
 	if group.policy != codePolicy {
@@ -458,6 +478,21 @@ func groupPage(ctx context.Context, call rpc.Call, page pageInput, limit int, fi
 }
 
 func discoverGroups(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error) {
+	return searchGroups(ctx, call, raw, false)
+}
+
+func manageGroups(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error) {
+	allowed, err := moderation.IsSiteAdmin(ctx, call.DB, call.Actor.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, rpc.Denied("Administrator access required")
+	}
+	return searchGroups(ctx, call, raw, true)
+}
+
+func searchGroups(ctx context.Context, call rpc.Call, raw json.RawMessage, management bool) (any, error) {
 	in, err := rpc.Decode[struct {
 		pageInput
 		Query string `json:"query"`
@@ -473,7 +508,11 @@ func discoverGroups(ctx context.Context, call rpc.Call, raw json.RawMessage) (an
 	if err != nil {
 		return nil, err
 	}
-	return groupPage(ctx, call, in.pageInput, limit, listedGroupSQL+` AND ($3='' OR strpos(lower(c.title),lower($3))>0)`, query)
+	const titleMatches = `($3='' OR strpos(lower(c.title),lower($3))>0)`
+	if management {
+		return groupPage(ctx, call, in.pageInput, limit, titleMatches+` AND EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=$4)`, query, call.Actor.ID)
+	}
+	return groupPage(ctx, call, in.pageInput, limit, listedGroupSQL+` AND `+titleMatches, query)
 }
 
 const myGroupSQL = `EXISTS(SELECT 1 FROM conversation_members m WHERE m.conversation_id=c.id AND m.user_id=$3)`
@@ -534,6 +573,8 @@ func commonGroups(ctx context.Context, call rpc.Call, raw json.RawMessage) (any,
 type groupProfileItem struct {
 	groupSummary
 	Role             *string `json:"role"`
+	CanManage        bool    `json:"can_manage"`
+	CanAdminister    bool    `json:"can_administer"`
 	Announcement     *string `json:"announcement,omitempty"`
 	InviteCode       *string `json:"invite_code,omitempty"`
 	AllowInvite      *bool   `json:"allow_invite,omitempty"`
@@ -550,20 +591,26 @@ func groupProfile(ctx context.Context, call rpc.Call, raw json.RawMessage) (any,
 		return nil, err
 	}
 	var item groupProfileItem
-	err = call.DB.QueryRow(ctx, `SELECT `+groupSummaryColumns+`,m.role,
-		CASE WHEN m.role IS NOT NULL THEN c.announcement END,
-		CASE WHEN m.role IN ('owner','admin') AND c.join_policy='code' THEN
+	err = call.DB.QueryRow(ctx, `SELECT `+groupSummaryColumns+`,m.role,acl.can_manage,acl.can_administer,
+		CASE WHEN acl.can_view THEN c.announcement END,
+		CASE WHEN acl.can_manage AND c.join_policy='code' THEN
 			CASE WHEN c.code_single_use THEN c.invite_code ELSE COALESCE(c.fixed_code,c.invite_code) END END,
-		CASE WHEN m.role IS NOT NULL THEN c.allow_invite END,
-		CASE WHEN m.role IN ('owner','admin') THEN c.discoverable END,
-		CASE WHEN m.role IN ('owner','admin') AND c.join_policy='code' THEN c.code_single_use END,
+		CASE WHEN acl.can_view THEN c.allow_invite END,
+		CASE WHEN acl.can_manage THEN c.discoverable END,
+		CASE WHEN acl.can_manage AND c.join_policy='code' THEN c.code_single_use END,
 		CASE WHEN c.join_policy='approval' THEN c.join_question END,
-		CASE WHEN m.role IS NOT NULL THEN c.global_mute END,
+		CASE WHEN acl.can_view THEN c.global_mute END,
 		(SELECT j.id FROM group_join_requests j WHERE j.conversation_id=c.id AND j.user_id=$2 AND j.kind='application' AND j.status='pending')
 		FROM conversations c JOIN accounts o ON o.id=c.owner_id
 		LEFT JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
-		WHERE c.id=$1 AND `+openGroupSQL+` AND (c.visibility='public' OR m.role IS NOT NULL)`, in.ConversationID, call.Actor.ID).
-		Scan(append(item.columns(), &item.Role, &item.Announcement, &item.InviteCode, &item.AllowInvite, &item.Discoverable, &item.CodeSingleUse, &item.JoinQuestion, &item.GlobalMute, &item.PendingRequestID)...)
+		LEFT JOIN active_site_admins site ON site.user_id=$2
+		CROSS JOIN LATERAL (SELECT
+			(site.user_id IS NOT NULL OR m.role IS NOT NULL) AS can_view,
+			(site.user_id IS NOT NULL OR coalesce(m.role IN ('owner','admin'),false)) AS can_manage,
+			(site.user_id IS NOT NULL OR coalesce(m.role='owner',false)) AS can_administer) acl
+		WHERE c.id=$1 AND `+openGroupSQL+` AND (c.visibility='public' OR acl.can_view)`, in.ConversationID, call.Actor.ID).
+		Scan(append(item.columns(), &item.Role, &item.CanManage, &item.CanAdminister, &item.Announcement, &item.InviteCode,
+			&item.AllowInvite, &item.Discoverable, &item.CodeSingleUse, &item.JoinQuestion, &item.GlobalMute, &item.PendingRequestID)...)
 	return item, err
 }
 
@@ -593,19 +640,20 @@ func listGroupMembers(ctx context.Context, call rpc.Call, raw json.RawMessage) (
 	if err != nil {
 		return nil, err
 	}
-	visibility, role, err := readGroupRole(ctx, call, in.ConversationID)
+	visibility, authority, err := readGroupAuthority(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(visibility, role, role != ""); err != nil {
+	if err := needRole(visibility, authority.role, authority.role != "" || authority.siteAdmin); err != nil {
 		return nil, err
 	}
 	// Recheck access in the data statement in case membership changed after the first read.
 	items, err := collect(ctx, call.DB, `SELECT a.id,a.username,a.nickname,a.avatar_id::text,m.role,coalesce(nullif(m.title,''),group_default_title(m.level)),m.level,m.joined_at,m.muted_until,
 		COALESCE(m.muted_until>clock_timestamp(),false) FROM conversation_members m JOIN accounts a ON a.id=m.user_id
 		JOIN conversations c ON c.id=m.conversation_id
-		JOIN conversation_members actor ON actor.conversation_id=c.id AND actor.user_id=$2
-		WHERE c.id=$1 AND `+openGroupSQL+` AND m.user_id>$3 AND `+eligibleAccount+` ORDER BY m.user_id LIMIT $4`,
+		LEFT JOIN conversation_members actor ON actor.conversation_id=c.id AND actor.user_id=$2
+		WHERE c.id=$1 AND `+openGroupSQL+` AND (actor.user_id IS NOT NULL OR EXISTS(SELECT 1 FROM active_site_admins WHERE user_id=$2))
+		AND m.user_id>$3 AND `+eligibleAccount+` ORDER BY m.user_id LIMIT $4`,
 		func(row pgx.CollectableRow) (memberItem, error) {
 			var item memberItem
 			err := row.Scan(&item.UserID, &item.Username, &item.Nickname, &item.AvatarID, &item.Role, &item.Title, &item.Level, &item.JoinedAt, &item.MutedUntil, &item.Muted)

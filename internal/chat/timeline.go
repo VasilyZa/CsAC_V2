@@ -57,10 +57,10 @@ func conversations(ctx context.Context, call rpc.Call, raw json.RawMessage) (any
 		ORDER BY h.last_sent_at DESC,c.id DESC LIMIT $5)
 		SELECT v.id,v.kind,coalesce(v.peer_title,v.title),coalesce(v.peer_avatar,v.avatar_id)::text,v.peer_id,v.head,v.read_seq,
 		CASE WHEN v.history_visible THEN (SELECT count(*) FROM messages incoming
-			WHERE incoming.conversation_id=v.id AND incoming.sender_id<>$1 AND incoming.seq>v.read_seq) ELSE 0 END,
+			WHERE incoming.conversation_id=v.id AND incoming.sender_id<>$1 AND incoming.seq>v.read_seq AND incoming.kind<>'system') ELSE 0 END,
 		v.last_sent_at,coalesce(last.kind,''),coalesce(CASE WHEN last.recalled_at IS NULL THEN left(last.body,200) END,''),v.hidden
 		FROM visible v LEFT JOIN LATERAL (
-			SELECT m.kind,m.recalled_at,m.body FROM messages m WHERE v.history_visible AND m.conversation_id=v.id
+			SELECT m.kind,m.recalled_at,m.body FROM messages m WHERE v.history_visible AND m.conversation_id=v.id AND m.kind<>'system'
 			ORDER BY m.seq DESC LIMIT 1
 		) last ON true
 		ORDER BY v.last_sent_at DESC,v.id DESC`, call.Actor.ID, in.IncludeHidden, in.Before, in.BeforeID, in.Limit+1)
@@ -142,7 +142,7 @@ func recall(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error
 	if in.ConversationID <= 0 || in.Seq <= 0 {
 		return nil, rpc.Invalid("Choose a conversation and message sequence")
 	}
-	a, err := accessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, true)
+	a, err := reviewAccessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -150,11 +150,10 @@ func recall(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error
 	var prior, allowed *string
 	// Read the clock only after the row lock has been acquired.
 	err = call.DB.QueryRow(ctx, `WITH locked AS MATERIALIZED (
-			SELECT m.recalled_at,m.recall_kind,m.sender_id,m.created_at,coalesce(cm.role,'member') AS sender_role
-			FROM messages m LEFT JOIN conversation_members cm ON cm.conversation_id=m.conversation_id AND cm.user_id=m.sender_id
-			WHERE m.conversation_id=$1 AND m.seq=$2 FOR UPDATE OF m
-		) SELECT recalled_at,recall_kind,chat_recall_kind(sender_id,$3,sender_role,$4,created_at,clock_timestamp())
-		FROM locked`, in.ConversationID, in.Seq, call.Actor.ID, a.role).
+			SELECT recalled_at,recall_kind,sender_id,kind,created_at FROM messages
+			WHERE conversation_id=$1 AND seq=$2 FOR NO KEY UPDATE
+		) SELECT recalled_at,recall_kind,chat_recall_kind(sender_id,$3,kind,sender_id=$6,$4,$5,created_at,clock_timestamp())
+		FROM locked`, in.ConversationID, in.Seq, call.Actor.ID, a.role, a.siteAdmin, a.owner).
 		Scan(&recalled, &prior, &allowed)
 	if err != nil {
 		return nil, err
@@ -189,42 +188,76 @@ func recall(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error
 	return out, call.EmitChat(in.ConversationID, 0, "message.recalled", ids, out)
 }
 
+type featureChange struct {
+	messageRef
+	Featured bool `json:"featured"`
+}
+
 func feature(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, error) {
-	in, err := rpc.Decode[struct {
-		messageRef
-		Featured bool `json:"featured"`
-	}](raw)
+	in, err := rpc.Decode[featureChange](raw)
 	if err != nil {
 		return nil, err
 	}
-	a, err := accessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, true)
+	if in.ConversationID <= 0 || in.Seq <= 0 {
+		return nil, rpc.Invalid("Choose a conversation and message sequence")
+	}
+	a, err := reviewAccessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, true)
 	if err != nil {
 		return nil, err
 	}
 	if !canManage(a) {
 		return nil, rpc.Denied("Group manager role required")
 	}
+	var subjectID int64
+	var subjectName string
+	// Order feature changes and recalls of this message. The weaker row lock
+	// still lets a concurrent chat.send reference the original as a reply.
+	err = call.DB.QueryRow(ctx, `SELECT m.sender_id,a.nickname FROM messages m JOIN accounts a ON a.id=m.sender_id
+		WHERE m.conversation_id=$1 AND m.seq=$2 AND m.recalled_at IS NULL AND m.kind<>'system' FOR NO KEY UPDATE OF m`, in.ConversationID, in.Seq).
+		Scan(&subjectID, &subjectName)
+	if err != nil {
+		if !in.Featured && errors.Is(err, pgx.ErrNoRows) {
+			return in, nil
+		}
+		return nil, err
+	}
+	var changed int64
+	action := "feature_removed"
 	if in.Featured {
-		var seq int64
-		err := call.DB.QueryRow(ctx, `SELECT seq FROM messages WHERE conversation_id=$1 AND seq=$2 AND recalled_at IS NULL FOR SHARE`, in.ConversationID, in.Seq).Scan(&seq)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, rpc.NotFound("Message unavailable")
-		}
+		action = "feature_added"
+		tag, err := call.DB.Exec(ctx, `INSERT INTO featured_messages(conversation_id,seq,added_by) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, in.ConversationID, in.Seq, call.Actor.ID)
 		if err != nil {
 			return nil, err
 		}
-		_, err = call.DB.Exec(ctx, `INSERT INTO featured_messages(conversation_id,seq,added_by) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, in.ConversationID, in.Seq, call.Actor.ID)
-		if err != nil {
-			return nil, err
-		}
+		changed = tag.RowsAffected()
 	} else {
-		if _, err := call.DB.Exec(ctx, `DELETE FROM featured_messages WHERE conversation_id=$1 AND seq=$2`, in.ConversationID, in.Seq); err != nil {
+		tag, err := call.DB.Exec(ctx, `DELETE FROM featured_messages WHERE conversation_id=$1 AND seq=$2`, in.ConversationID, in.Seq)
+		if err != nil {
 			return nil, err
 		}
+		changed = tag.RowsAffected()
+	}
+	if changed == 0 {
+		return in, nil
 	}
 	ids, err := memberIDs(ctx, call.DB, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	return in, call.EmitChat(in.ConversationID, 0, "message.featured", ids, in)
+	if err := call.EmitChat(in.ConversationID, 0, "message.featured", ids, in); err != nil {
+		return nil, err
+	}
+	notice := message{
+		messageCreated: messageCreated{messageRef: messageRef{ConversationID: in.ConversationID}, Sender: call.Actor.ID, Kind: "system"},
+		SystemAction:   &action, SystemSubject: &subjectID, SystemSubjectName: &subjectName,
+	}
+	if err := call.DB.QueryRow(ctx, `UPDATE conversation_heads SET head=head+1 WHERE conversation_id=$1
+		RETURNING head,clock_timestamp()`, in.ConversationID).Scan(&notice.Seq, &notice.At); err != nil {
+		return nil, err
+	}
+	if _, err := call.DB.Exec(ctx, `INSERT INTO messages(conversation_id,seq,sender_id,kind,created_at,system_action,system_subject_id)
+		VALUES ($1,$2,$3,'system',$4,$5,$6)`, in.ConversationID, notice.Seq, notice.Sender, notice.At, action, subjectID); err != nil {
+		return nil, err
+	}
+	return in, call.EmitChat(in.ConversationID, notice.Seq, "message.created", ids, notice)
 }

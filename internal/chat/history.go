@@ -38,16 +38,20 @@ const messageDetailsQuery = `SELECT m.seq,m.sender_id,u.nickname,u.avatar_id::te
 	CASE WHEN c.kind='group' THEN coalesce(roster.level,1)::smallint END,
 	CASE WHEN c.kind='group' THEN coalesce(nullif(roster.title,''),group_default_title(coalesce(roster.level,1)::smallint)) END,
 	CASE WHEN m.recalled_at IS NOT NULL THEN coalesce(m.recall_kind,'unknown') END,
-	m.recalled_at IS NULL AND chat_recall_kind(m.sender_id,$1,coalesce(roster.role,'member'),viewer.role,m.created_at,statement_timestamp()) IS NOT NULL,
+	m.recalled_at IS NULL AND chat_recall_kind(m.sender_id,$1,m.kind,coalesce(c.owner_id=m.sender_id,false),
+		CASE WHEN c.kind='group' THEN coalesce(viewer.role,'') ELSE '' END,
+		c.kind='group' AND EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=$1),m.created_at,statement_timestamp()) IS NOT NULL,
 	CASE WHEN c.kind='direct' THEN m.seq<=recipient.read_seq END,
 	quote.recalled_at IS NOT NULL,
 	CASE WHEN quote.recalled_at IS NULL THEN quote.sender_id END,
 	CASE WHEN quote.recalled_at IS NULL THEN quoted_user.nickname END,
 	CASE WHEN quote.recalled_at IS NULL THEN quote.kind END,
-	CASE WHEN quote.recalled_at IS NULL THEN left(quote.body,160) END
+	CASE WHEN quote.recalled_at IS NULL THEN left(quote.body,160) END,
+	m.system_action,m.system_subject_id,subject.nickname
 	FROM messages m JOIN conversations c ON c.id=m.conversation_id
-	JOIN conversation_members viewer ON viewer.conversation_id=m.conversation_id AND viewer.user_id=$1
+	LEFT JOIN conversation_members viewer ON viewer.conversation_id=m.conversation_id AND viewer.user_id=$1
 	JOIN accounts u ON u.id=m.sender_id
+	LEFT JOIN accounts subject ON subject.id=m.system_subject_id
 	LEFT JOIN featured_messages f ON f.conversation_id=m.conversation_id AND f.seq=m.seq
 		AND m.recalled_at IS NULL AND f.added_at<=statement_timestamp()
 	LEFT JOIN accounts setter ON setter.id=f.added_by
@@ -57,7 +61,7 @@ const messageDetailsQuery = `SELECT m.seq,m.sender_id,u.nickname,u.avatar_id::te
 	LEFT JOIN messages quote ON quote.conversation_id=m.conversation_id AND quote.seq=m.reply_seq AND m.recalled_at IS NULL
 	LEFT JOIN accounts quoted_user ON quoted_user.id=quote.sender_id AND quote.recalled_at IS NULL
 	WHERE m.conversation_id=$2
-	AND EXISTS (SELECT 1 FROM chat_readers a WHERE a.conversation_id=m.conversation_id AND a.user_id=$1)`
+	AND EXISTS (SELECT 1 FROM chat_reviewers a WHERE a.conversation_id=m.conversation_id AND a.user_id=$1)`
 
 func scanMessageDetails(row interface{ Scan(...any) error }, room int64) (messageDetails, error) {
 	var m messageDetails
@@ -69,7 +73,8 @@ func scanMessageDetails(row interface{ Scan(...any) error }, room int64) (messag
 		&m.Reply, &m.Mentions, &m.At, &m.RecalledAt, &m.TargetID,
 		&m.Featured, &m.FeaturedBy, &m.FeaturedByName, &m.FeaturedAt, &level, &title,
 		&m.RecallKind, &m.CanRecall, &m.ReadByRecipient,
-		&quote.Recalled, &quote.Sender, &quote.SenderName, &quote.Kind, &quote.Preview); err != nil {
+		&quote.Recalled, &quote.Sender, &quote.SenderName, &quote.Kind, &quote.Preview,
+		&m.SystemAction, &m.SystemSubject, &m.SystemSubjectName); err != nil {
 		return m, err
 	}
 	if level != nil && title != nil {
@@ -94,7 +99,7 @@ func getMessage(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, e
 	if in.ConversationID <= 0 || in.Seq <= 0 {
 		return nil, rpc.Invalid("Choose a conversation and message sequence")
 	}
-	if _, err := accessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, false); err != nil {
+	if _, err := reviewAccessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, false); err != nil {
 		return nil, err
 	}
 	return scanMessageDetails(call.DB.QueryRow(ctx, messageDetailsQuery+` AND m.seq=$3`, call.Actor.ID, in.ConversationID, in.Seq), in.ConversationID)
@@ -129,7 +134,7 @@ func messagePage(ctx context.Context, call rpc.Call, raw json.RawMessage, featur
 	if in.Limit < 1 || in.Limit > 100 {
 		return nil, rpc.Invalid("Limit must be 1–100")
 	}
-	if _, err := accessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, false); err != nil {
+	if _, err := reviewAccessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, false); err != nil {
 		return nil, err
 	}
 	query := messageDetailsQuery + ` AND ($3::bigint=0 OR m.seq<$3) AND ($4::bigint=0 OR m.seq>$4)

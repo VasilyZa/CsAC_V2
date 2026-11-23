@@ -9,6 +9,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"csac/v2/internal/moderation"
 	"csac/v2/internal/rpc"
 	"github.com/jackc/pgx/v5"
 )
@@ -64,8 +65,10 @@ func listGroupFiles(ctx context.Context, call rpc.Call, raw json.RawMessage) (an
 	}
 	var out groupList
 	err = call.DB.QueryRow(ctx, `WITH visible AS (
-			SELECT c.id FROM conversations c JOIN conversation_members cm ON cm.conversation_id=c.id
-			WHERE c.id=$1 AND cm.user_id=$2 AND c.kind='group' AND c.archived_at IS NULL
+			SELECT c.id FROM conversations c
+			LEFT JOIN conversation_members cm ON cm.conversation_id=c.id AND cm.user_id=$2
+			WHERE c.id=$1 AND c.kind='group' AND c.archived_at IS NULL
+			AND (cm.user_id IS NOT NULL OR EXISTS (SELECT 1 FROM active_site_admins WHERE user_id=$2))
 		), files AS (
 			SELECT f.id, f.media_id::text AS media_id, f.folder_id, f.uploader_id, a.nickname AS uploader_name,
 			       m.filename, m.mime, m.size, m.expires_at, f.created_at
@@ -193,11 +196,18 @@ func changeFolder(ctx context.Context, call rpc.Call, raw json.RawMessage) (any,
 	if (in.Action == "create" && in.FolderID != 0) || (in.Action != "create" && in.FolderID <= 0) {
 		return nil, rpc.Invalid("Invalid folder ID")
 	}
-	role, err := lockGroup(ctx, call, in.ConversationID)
+	siteAdmin, err := moderation.IsSiteAdmin(ctx, call.DB, call.Actor.ID, true)
 	if err != nil {
 		return nil, err
 	}
-	if !managesGroup(role) {
+	role, err := lockGroupRole(ctx, call, in.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	if role == "" && !siteAdmin {
+		return nil, rpc.NotFound("Group unavailable")
+	}
+	if !siteAdmin && !managesGroup(role) {
 		return nil, rpc.Denied("Group owner or administrator required")
 	}
 	var out idResult
@@ -274,24 +284,29 @@ func authorizeFileChange(ctx context.Context, call rpc.Call, conversationID, fil
 	if fileID <= 0 {
 		return rpc.Invalid("Expected a file ID")
 	}
+	siteAdmin, err := moderation.IsSiteAdmin(ctx, call.DB, call.Actor.ID, true)
+	if err != nil {
+		return err
+	}
 	role, err := lockGroupRole(ctx, call, conversationID)
 	if err != nil {
 		return err
 	}
-	if role == "" && !withdrawOwn {
+	canView := siteAdmin || role != ""
+	if !canView && !withdrawOwn {
 		return rpc.NotFound("Group unavailable")
 	}
 	var uploaderID int64
 	err = call.DB.QueryRow(ctx, `SELECT f.uploader_id FROM group_files f JOIN media_objects m ON m.id=f.media_id
 		WHERE f.id=$1 AND f.conversation_id=$2 AND ($3::boolean OR f.uploader_id=$4) AND `+readyPredicate+` FOR UPDATE OF f`,
-		fileID, conversationID, role != "", call.Actor.ID).Scan(&uploaderID)
+		fileID, conversationID, canView, call.Actor.ID).Scan(&uploaderID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rpc.NotFound("Group file unavailable")
 	}
 	if err != nil {
 		return err
 	}
-	if call.Actor.ID != uploaderID && !managesGroup(role) {
+	if call.Actor.ID != uploaderID && !siteAdmin && !managesGroup(role) {
 		return rpc.Denied("Only the uploader or a group manager may change this file")
 	}
 	return nil

@@ -48,7 +48,7 @@ func featureStats(ctx context.Context, call rpc.Call, raw json.RawMessage) (any,
 	if in.TimeZone == "" {
 		in.TimeZone = defaultFeatureTimeZone
 	}
-	if _, err := accessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, false); err != nil {
+	if _, err := reviewAccessTo(ctx, call.DB, in.ConversationID, call.Actor.ID, false); err != nil {
 		return nil, err
 	}
 	if in.TimeZone != defaultFeatureTimeZone && in.TimeZone != "UTC" {
@@ -85,7 +85,7 @@ func summarizeFeatures(ctx context.Context, db rpc.DB, user int64, in featureSta
 		END AS in_period
 		FROM featured_messages f JOIN messages m USING (conversation_id,seq) CROSS JOIN bounds b
 		WHERE f.conversation_id=$1 AND m.recalled_at IS NULL AND f.added_at<=b.as_of
-		AND EXISTS (SELECT 1 FROM chat_readers r WHERE r.conversation_id=$1 AND r.user_id=$2)
+		AND EXISTS (SELECT 1 FROM chat_reviewers r WHERE r.conversation_id=$1 AND r.user_id=$2)
 	), ranked AS (
 		SELECT sender_id,count(*) AS count FROM features WHERE in_period
 		GROUP BY sender_id ORDER BY count DESC,sender_id LIMIT 10

@@ -104,17 +104,26 @@ func notifyGroupOwner(ctx context.Context, call rpc.Call, ownerID int64, title, 
 // Recheck persisted administrator access at execution time. Hold the account
 // share lock throughout a write so role revocation and active bans are ordered.
 func requireBanAdmin(ctx context.Context, call rpc.Call, lock bool) error {
-	query := `SELECT true FROM accounts WHERE id=$1 AND site_admin
-		AND (status='active' OR (status='banned' AND ban_until<=statement_timestamp()))`
+	allowed, err := IsSiteAdmin(ctx, call.DB, call.Actor.ID, lock)
+	if err == nil && !allowed {
+		return rpc.Denied("Administrator access required")
+	}
+	return err
+}
+
+// IsSiteAdmin checks the current database role. Group management writes take
+// the account share lock before the conversation lock.
+func IsSiteAdmin(ctx context.Context, db rpc.DB, user int64, lock bool) (bool, error) {
+	query := `SELECT true FROM active_site_admins WHERE user_id=$1`
 	if lock {
 		query += ` FOR SHARE`
 	}
 	var allowed bool
-	err := call.DB.QueryRow(ctx, query, call.Actor.ID).Scan(&allowed)
+	err := db.QueryRow(ctx, query, user).Scan(&allowed)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return rpc.Denied("Administrator access required")
+		return false, nil
 	}
-	return err
+	return allowed, err
 }
 
 type banItem struct {

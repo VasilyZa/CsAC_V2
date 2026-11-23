@@ -36,6 +36,7 @@ func Register(registry *rpc.Registry) {
 	write("friends.remark", remarkFriend)
 
 	read("groups.discover", discoverGroups)
+	registry.Register("groups.manage_list", rpc.Method{Access: rpc.Admin, Handle: manageGroups})
 	read("groups.list", listGroups)
 	read("groups.owned", ownedGroups)
 	read("groups.profile", groupProfile)

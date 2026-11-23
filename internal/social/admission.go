@@ -170,11 +170,11 @@ func inviteGroup(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, 
 	if err := otherUser(actor, target); err != nil {
 		return nil, err
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(group.visibility, role, moderator(role) || (role == memberRole && group.allowInvite)); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.manages() || (authority.role == memberRole && group.allowInvite)); err != nil {
 		return nil, err
 	}
 	if err := requireAdmissionOpen(ctx, call.DB, group.id); err != nil {
@@ -252,7 +252,7 @@ func respondJoin(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, 
 	if in.RequestID <= 0 || in.Accept == nil {
 		return nil, rpc.Invalid("request_id and accept are required")
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +266,7 @@ func respondJoin(ctx context.Context, call rpc.Call, raw json.RawMessage) (any, 
 		return nil, err
 	}
 	if kind == "application" {
-		if err := needRole(group.visibility, role, moderator(role)); err != nil {
+		if err := needRole(group.visibility, authority.role, authority.manages()); err != nil {
 			return nil, err
 		}
 	}
@@ -327,7 +327,13 @@ func validateInviter(ctx context.Context, call rpc.Call, group lockedGroup, invi
 		return err
 	}
 	if !moderator(role) && (role != memberRole || !group.allowInvite) {
-		return rpc.Conflict("Invitation is no longer valid")
+		siteAdmin, err := moderation.IsSiteAdmin(ctx, call.DB, inviter, false)
+		if err != nil {
+			return err
+		}
+		if !siteAdmin {
+			return rpc.Conflict("Invitation is no longer valid")
+		}
 	}
 	if err := activeAccount(ctx, call.DB, inviter); err != nil {
 		return err
@@ -369,17 +375,18 @@ func listApplications(ctx context.Context, call rpc.Call, raw json.RawMessage) (
 	if err != nil {
 		return nil, err
 	}
-	visibility, role, err := readGroupRole(ctx, call, in.ConversationID)
+	visibility, authority, err := readGroupAuthority(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(visibility, role, moderator(role)); err != nil {
+	if err := needRole(visibility, authority.role, authority.manages()); err != nil {
 		return nil, err
 	}
 	items, err := collect(ctx, call.DB, `SELECT `+joinRequestColumns+` FROM group_join_requests j
 		JOIN conversations c ON c.id=j.conversation_id JOIN accounts a ON a.id=j.user_id
-		JOIN conversation_members actor ON actor.conversation_id=c.id AND actor.user_id=$2 AND actor.role IN ('owner','admin')
+		LEFT JOIN conversation_members actor ON actor.conversation_id=c.id AND actor.user_id=$2 AND actor.role IN ('owner','admin')
 		WHERE j.conversation_id=$1 AND `+openGroupSQL+` AND j.kind='application' AND j.status='pending'
+		AND (actor.user_id IS NOT NULL OR EXISTS(SELECT 1 FROM active_site_admins WHERE user_id=$2))
 		AND ($3::bigint=0 OR j.id<$3) ORDER BY j.id DESC LIMIT $4`, scanJoinRequest, in.ConversationID, call.Actor.ID, in.BeforeID, limit+1)
 	return paginate(items, limit, func(item joinRequestItem) int64 { return item.RequestID }), err
 }

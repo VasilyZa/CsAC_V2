@@ -1,0 +1,71 @@
+name: Build and deploy backend
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Verify Go packages
+        run: go test ./...
+      - name: Build production image
+        run: >-
+          docker build --platform linux/amd64
+          --label "org.opencontainers.image.revision=$GITHUB_SHA"
+          -t "csac-v2-local:$GITHUB_SHA-$GITHUB_RUN_NUMBER" .
+      - name: Package image
+        if: github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+        run: |
+          set -o pipefail
+          docker image save "csac-v2-local:$GITHUB_SHA-$GITHUB_RUN_NUMBER" | gzip -1 > backend.tar.gz
+      - name: Store release artifact
+        if: github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: backend
+          path: backend.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          overwrite: true
+
+  deploy:
+    if: github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    environment: production
+    steps:
+      - name: Check out deployment script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download built image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: backend
+      - name: Deploy and check readiness
+        env:
+          CSAC_DEPLOY_HOST: ${{ secrets.CSAC_DEPLOY_HOST }}
+          CSAC_DEPLOY_PORT: ${{ secrets.CSAC_DEPLOY_PORT }}
+          CSAC_DEPLOY_USER: ${{ secrets.CSAC_DEPLOY_USER }}
+          CSAC_DEPLOY_KEY: ${{ secrets.CSAC_DEPLOY_KEY }}
+          CSAC_DEPLOY_KNOWN_HOSTS: ${{ secrets.CSAC_DEPLOY_KNOWN_HOSTS }}
+        run: bash .github/scripts/publish.sh backend.tar.gz

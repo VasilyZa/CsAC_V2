@@ -22,11 +22,11 @@ func setGroupAdmin(ctx context.Context, call rpc.Call, raw json.RawMessage) (any
 	if in.Admin == nil {
 		return nil, rpc.Invalid("admin is required")
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(group.visibility, role, role == ownerRole); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.administers()); err != nil {
 		return nil, err
 	}
 	target, err := memberRoleAt(ctx, call.DB, group.id, in.UserID)
@@ -62,16 +62,15 @@ func setGroupAdmin(ctx context.Context, call rpc.Call, raw json.RawMessage) (any
 	return fields{"role": newRole}, nil
 }
 
-// The caller holds the conversation lock. Only the owner can moderate an admin.
 func moderationTarget(ctx context.Context, call rpc.Call, groupID, targetID int64, ownerSelfTitle bool) (lockedGroup, error) {
 	if targetID <= 0 || (!ownerSelfTitle && targetID == call.Actor.ID) {
 		return lockedGroup{}, rpc.Invalid("user_id must identify a valid moderation target")
 	}
-	group, role, err := lockWithRole(ctx, call, groupID)
+	group, authority, err := lockForManagement(ctx, call, groupID)
 	if err != nil {
 		return group, err
 	}
-	if err := needRole(group.visibility, role, moderator(role)); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.manages()); err != nil {
 		return group, err
 	}
 	targetRole, err := memberRoleAt(ctx, call.DB, group.id, targetID)
@@ -81,8 +80,8 @@ func moderationTarget(ctx context.Context, call rpc.Call, groupID, targetID int6
 	if targetRole == "" {
 		return group, rpc.NotFound("Group member not found")
 	}
-	if (targetRole == ownerRole && (!ownerSelfTitle || targetID != call.Actor.ID)) ||
-		(targetRole == adminRole && role != ownerRole) {
+	canEditOwnerTitle := ownerSelfTitle && (targetID == call.Actor.ID || authority.siteAdmin)
+	if (targetRole == ownerRole && !canEditOwnerTitle) || (targetRole == adminRole && !authority.administers()) {
 		return group, rpc.Denied("You cannot moderate this member")
 	}
 	return group, nil
@@ -206,11 +205,11 @@ func disbandGroup(ctx context.Context, call rpc.Call, raw json.RawMessage) (any,
 	if err != nil {
 		return nil, err
 	}
-	group, role, err := lockWithRole(ctx, call, in.ConversationID)
+	group, authority, err := lockForManagement(ctx, call, in.ConversationID)
 	if err != nil {
 		return nil, err
 	}
-	if err := needRole(group.visibility, role, role == ownerRole); err != nil {
+	if err := needRole(group.visibility, authority.role, authority.administers()); err != nil {
 		return nil, err
 	}
 	users, err := groupRecipients(ctx, call.DB, group.id, false, 0)

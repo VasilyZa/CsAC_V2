@@ -46,21 +46,42 @@ type conversationRef struct {
 }
 
 type access struct {
-	kind  string
-	role  string
-	muted bool
-	peer  int64
+	kind      string
+	role      string
+	muted     bool
+	peer      int64
+	owner     int64
+	siteAdmin bool
 }
 
 func accessTo(ctx context.Context, db rpc.DB, id, user int64, lock bool) (access, error) {
+	return conversationAccess(ctx, db, id, user, lock, false)
+}
+
+func reviewAccessTo(ctx context.Context, db rpc.DB, id, user int64, lock bool) (access, error) {
+	allowReview := true
+	if lock {
+		// Serialize execution with a site role revocation before taking the
+		// conversation lock. A read can use the role from its statement snapshot.
+		var err error
+		allowReview, err = moderation.IsSiteAdmin(ctx, db, user, true)
+		if err != nil {
+			return access{}, err
+		}
+	}
+	return conversationAccess(ctx, db, id, user, lock, allowReview)
+}
+
+func conversationAccess(ctx context.Context, db rpc.DB, id, user int64, lock, allowReview bool) (access, error) {
 	var a access
 	var suspended bool
-	sql := `SELECT c.kind,m.role,
-		c.kind='group' AND (coalesce(m.muted_until>statement_timestamp(),false) OR (c.global_mute AND m.role='member')),
+	sql := `SELECT c.kind,coalesce(m.role,''),
+		c.kind='group' AND (coalesce(m.muted_until>statement_timestamp(),false) OR (c.global_mute AND coalesce(m.role='member',false))),
 		CASE WHEN c.direct_low=$2 THEN c.direct_high ELSE coalesce(c.direct_low,0) END,
-		coalesce(c.site_ban_until>statement_timestamp(),false)
-		FROM conversation_members m JOIN conversations c ON c.id=m.conversation_id
-		WHERE c.id=$1 AND m.user_id=$2 AND c.archived_at IS NULL`
+		coalesce(c.site_ban_until>statement_timestamp(),false),coalesce(c.owner_id,0),site.user_id IS NOT NULL
+		FROM conversations c LEFT JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
+		LEFT JOIN active_site_admins site ON $3 AND c.kind='group' AND site.user_id=$2
+		WHERE c.id=$1 AND c.archived_at IS NULL AND (m.user_id IS NOT NULL OR site.user_id IS NOT NULL)`
 	if lock {
 		var lockedID int64
 		err := db.QueryRow(ctx, `SELECT id FROM conversations WHERE id=$1 AND archived_at IS NULL FOR SHARE`, id).Scan(&lockedID)
@@ -71,7 +92,7 @@ func accessTo(ctx context.Context, db rpc.DB, id, user int64, lock bool) (access
 			return a, err
 		}
 	}
-	err := db.QueryRow(ctx, sql, id, user).Scan(&a.kind, &a.role, &a.muted, &a.peer, &suspended)
+	err := db.QueryRow(ctx, sql, id, user, allowReview).Scan(&a.kind, &a.role, &a.muted, &a.peer, &suspended, &a.owner, &a.siteAdmin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, rpc.NotFound("Conversation unavailable")
 	}
@@ -79,9 +100,10 @@ func accessTo(ctx context.Context, db rpc.DB, id, user int64, lock bool) (access
 		return a, err
 	}
 	if a.kind == "direct" {
+		a.role = ""
 		return a, requireFriend(ctx, db, user, a.peer, lock)
 	}
-	if suspended {
+	if suspended && !a.siteAdmin {
 		return a, moderation.GroupBanned()
 	}
 	return a, nil
@@ -160,4 +182,6 @@ func memberIDs(ctx context.Context, db rpc.DB, id int64) ([]int64, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
-func canManage(a access) bool { return a.kind == "group" && (a.role == "owner" || a.role == "admin") }
+func canManage(a access) bool {
+	return a.kind == "group" && (a.siteAdmin || a.role == "owner" || a.role == "admin")
+}
