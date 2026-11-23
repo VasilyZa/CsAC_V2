@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: csac
+      POSTGRES_USER: csac
+      POSTGRES_PASSWORD: ${CSAC_POSTGRES_PASSWORD:?Set CSAC_POSTGRES_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "csac", "-d", "csac"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  csacd:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CSAC_ADDR: ":${CSAC_PORT:-8443}"
+      CSAC_DATABASE_URL: "postgresql://csac:${CSAC_POSTGRES_PASSWORD}@postgres:5432/csac?sslmode=disable"
+      CSAC_TLS_CERT: /run/csac/tls.crt
+      CSAC_TLS_KEY: /run/csac/tls.key
+      CSAC_PASSWORD_PEPPER: ${CSAC_PASSWORD_PEPPER:?Set CSAC_PASSWORD_PEPPER}
+      CSAC_ACCOUNT_KEY: ${CSAC_ACCOUNT_KEY:?Set CSAC_ACCOUNT_KEY}
+      CSAC_RELEASE_ROOT: /var/lib/csac/releases
+      CSAC_RELEASE_GITHUB_REPO:
+      CSAC_RELEASE_POLL_MINUTES:
+      CSAC_RELEASE_DEPLOY_WEB:
+      CSAC_ADMIN_UIDS:
+      CSAC_ALLOWED_ORIGINS:
+      CSAC_TRUSTED_PROXY_TOKEN:
+      CSAC_MAX_FILE_BYTES:
+      CSAC_FILE_RETENTION_DAYS:
+      CSAC_FILE_ALLOWED_TYPES:
+      CSAC_REQUIRE_REGISTRATION_EMAIL: ${CSAC_REQUIRE_REGISTRATION_EMAIL:-true}
+      CSAC_REQUIRE_MEMBER_EMAIL: ${CSAC_REQUIRE_MEMBER_EMAIL:-true}
+      CSAC_SMTP_HOST:
+      CSAC_SMTP_PORT:
+      CSAC_SMTP_USERNAME:
+      CSAC_SMTP_PASSWORD:
+      CSAC_SMTP_FROM:
+    ports:
+      - "${CSAC_BIND_IP:-127.0.0.1}:${CSAC_PORT:-8443}:${CSAC_PORT:-8443}/tcp"
+      - "${CSAC_BIND_IP:-127.0.0.1}:${CSAC_PORT:-8443}:${CSAC_PORT:-8443}/udp"
+    volumes:
+      - type: bind
+        source: ${CSAC_CERT_DIR:-./certs}
+        target: /run/csac
+        read_only: true
+        bind:
+          create_host_path: false
+      - media:/var/lib/csac/media
+      - releases:/var/lib/csac/releases
+
+volumes:
+  postgres:
+  media:
+  releases:

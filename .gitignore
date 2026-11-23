@@ -1,0 +1,6 @@
+.env
+/data/
+/certs/
+/bin/
+*.cover
+*.test
