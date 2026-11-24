@@ -59,6 +59,8 @@ go build -trimpath -tags timetzdata -o bin/csac-migrate ./cmd/csac-migrate
 
 ## 接口
 
+[第三方客户端 API 开发者手册](docs/api.md)
+
 | 路径 | 用途 |
 | --- | --- |
 | `/v2/socket` | WebSocket 命令、事件和补收 |
